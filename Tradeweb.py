@@ -28,6 +28,10 @@ def next_weekday(d: date) -> date:
     return nd
 
 
+def derive_trade_date(portfolio_date: date) -> date:
+    return next_weekday(portfolio_date)
+
+
 def safe_str(value):
     if value is None:
         return ""
@@ -100,6 +104,183 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*]', "_", name)
     name = re.sub(r"\s+", " ", name).strip()
     return name
+
+
+PORTFELJ_COLUMN_ALIASES = {
+    "position_type": ("Vrsta pozicije", "Position type", "Vrsta"),
+    "currency": ("Valuta", "Currency"),
+    "position_name": ("Pozicija", "Position", "Holding name", "Naziv pozicije"),
+    "isin": ("ISIN",),
+    "instrument_type": ("Tip", "Type", "Instrument type"),
+    "quantity": ("Količina", "Kolicina", "Quantity"),
+    "price": ("Cijena", "Price"),
+    "fx_rate": ("Tečaj DV", "Tecaj DV", "FX", "FX rate", "Exchange rate"),
+    "accrued_interest": ("Kamata", "Accrued interest", "Interest"),
+    "amount_base": ("Iznos DV", "Amount DV", "Base amount", "Amount in base currency"),
+}
+
+PRINOS_COLUMN_ALIASES = {
+    "date": ("Datum", "Date", "Portfolio date", "NAV date"),
+    "fund_name": ("Fund name", "Naziv fonda", "Client", "Klijent"),
+    "fund_currency": ("Fund currency", "Currency", "Valuta", "Valuta fonda"),
+    "number_of_units": ("NUMBER_OF_UNITS", "Number of units", "Broj udjela", "Broj jedinica", "Units"),
+    "nav_per_share": ("NAV_PER_SHARE", "NAV per share", "NAV/share", "Share NAV", "Cijena udjela"),
+}
+
+GENERAL_COLUMN_ALIASES = {
+    "fund_isin": ("FUND ISIN", "Fund ISIN", "ISIN"),
+    "fund_name": ("FUND NAME", "Fund name", "Naziv fonda"),
+    "fund_ticker": ("BLOOMBERG TICKER", "Bloomberg ticker", "Ticker", "Bloomberg"),
+    "output_name": ("OUTPUT FILE NAME", "Output file name", "File name", "Naziv izlazne datoteke"),
+}
+
+ASSET_CLASS_COLUMN_ALIASES = {
+    "croatian": ("HRVATSKI", "Croatian", "Asset class HR"),
+    "english": ("ENGLISH", "English", "Asset class EN"),
+}
+
+ACTUAL_CASH_COLUMN_ALIASES = {
+    "cash_item": ("SMATRA SE ACTUAL CASH-OM", "Actual cash", "Cash item", "Vrsta pozicije"),
+}
+
+
+def normalize_header_name(value):
+    text = normalize_text_loose(value)
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def column_name_matches(normalized_label: str, normalized_alias: str) -> bool:
+    if not normalized_label or not normalized_alias:
+        return False
+
+    if normalized_label == normalized_alias:
+        return True
+
+    if len(normalized_alias) >= 6 and normalized_alias in normalized_label:
+        return True
+
+    if len(normalized_label) >= 6 and normalized_label in normalized_alias:
+        return True
+
+    return False
+
+
+def resolve_columns_from_labels(labels, alias_map):
+    candidates = []
+    for label in labels:
+        label_text = safe_str(label)
+        if label_text == "" or label_text.startswith("Unnamed"):
+            continue
+        candidates.append((label, normalize_header_name(label_text)))
+
+    resolved = {}
+
+    for field, aliases in alias_map.items():
+        normalized_aliases = [normalize_header_name(alias) for alias in aliases]
+        normalized_aliases = [alias for alias in normalized_aliases if alias]
+
+        exact_match = next(
+            (
+                label
+                for label, normalized_label in candidates
+                if normalized_label in normalized_aliases
+            ),
+            None,
+        )
+        if exact_match is not None:
+            resolved[field] = exact_match
+            continue
+
+        fuzzy_match = next(
+            (
+                label
+                for label, normalized_label in candidates
+                if any(
+                    column_name_matches(normalized_label, normalized_alias)
+                    for normalized_alias in normalized_aliases
+                )
+            ),
+            None,
+        )
+        if fuzzy_match is not None:
+            resolved[field] = fuzzy_match
+
+    return resolved
+
+
+def resolve_dataframe_columns(df: pd.DataFrame, alias_map, required_fields, context: str, fallback_indices=None):
+    resolved = resolve_columns_from_labels(df.columns.tolist(), alias_map)
+
+    if fallback_indices:
+        for field, idx in fallback_indices.items():
+            if field in resolved:
+                continue
+            if 0 <= idx < len(df.columns):
+                resolved[field] = df.columns[idx]
+
+    missing = [field for field in required_fields if field not in resolved]
+    if missing:
+        available_headers = ", ".join(safe_str(col) for col in df.columns if safe_str(col))
+        raise ValueError(
+            f"Could not resolve required column(s) {', '.join(missing)} in {context}. "
+            f"Available headers: {available_headers}"
+        )
+
+    return resolved
+
+
+def build_named_table_from_raw(
+    df_raw: pd.DataFrame,
+    alias_map,
+    required_fields,
+    context: str,
+    min_matches: int,
+    fallback_indices=None,
+):
+    if df_raw.empty:
+        raise ValueError(f"{context} is empty.")
+
+    header_row_idx = None
+    best_match_count = -1
+
+    for idx in range(len(df_raw)):
+        header_candidates = build_duplicate_headers(df_raw.iloc[idx].tolist())
+        resolved = resolve_columns_from_labels(header_candidates, alias_map)
+        match_count = len(resolved)
+
+        if match_count > best_match_count:
+            best_match_count = match_count
+
+        if match_count >= min_matches:
+            header_row_idx = idx
+            break
+
+    if header_row_idx is None:
+        raise ValueError(
+            f"Could not find a header row in {context}. "
+            f"Best matched {best_match_count} expected header(s)."
+        )
+
+    headers = build_duplicate_headers(df_raw.iloc[header_row_idx].tolist())
+    data_df = df_raw.iloc[header_row_idx + 1 :].copy().reset_index(drop=True)
+    data_df.columns = headers
+
+    resolved_columns = resolve_dataframe_columns(
+        data_df,
+        alias_map=alias_map,
+        required_fields=required_fields,
+        context=context,
+        fallback_indices=fallback_indices,
+    )
+
+    return data_df, resolved_columns
+
+
+def get_row_value(row: pd.Series, columns: dict, key: str):
+    column_name = columns.get(key)
+    if not column_name:
+        return None
+    return row.get(column_name)
 
 
 # =========================================================
@@ -222,10 +403,40 @@ def load_additional_data(additional_source):
     asset_class.columns = build_duplicate_headers(asset_class.columns.tolist())
     actual_cash.columns = build_duplicate_headers(actual_cash.columns.tolist())
 
+    general_columns = resolve_dataframe_columns(
+        general,
+        alias_map=GENERAL_COLUMN_ALIASES,
+        required_fields=["fund_isin", "fund_name", "output_name"],
+        context="ADDITIONAL_DATA / GENERAL",
+        fallback_indices={
+            "fund_isin": 0,
+            "fund_name": 1,
+            "fund_ticker": 3,
+            "output_name": 4,
+        },
+    )
+    asset_class_columns = resolve_dataframe_columns(
+        asset_class,
+        alias_map=ASSET_CLASS_COLUMN_ALIASES,
+        required_fields=["croatian", "english"],
+        context="ADDITIONAL_DATA / ASSET_CLASS",
+        fallback_indices={"croatian": 0, "english": 1},
+    )
+    actual_cash_columns = resolve_dataframe_columns(
+        actual_cash,
+        alias_map=ACTUAL_CASH_COLUMN_ALIASES,
+        required_fields=["cash_item"],
+        context="ADDITIONAL_DATA / ACTUAL_CASH",
+        fallback_indices={"cash_item": 0},
+    )
+
     return {
         "GENERAL": general,
+        "GENERAL_COLUMNS": general_columns,
         "ASSET_CLASS": asset_class,
+        "ASSET_CLASS_COLUMNS": asset_class_columns,
         "ACTUAL_CASH": actual_cash,
+        "ACTUAL_CASH_COLUMNS": actual_cash_columns,
     }
 
 
@@ -237,44 +448,69 @@ def extract_fund_name_from_portfelj(df_raw: pd.DataFrame) -> str:
     if df_raw.empty:
         return ""
 
-    col_a = df_raw.iloc[:, 0].astype(str)
-    mask = col_a.str.contains("Klijent:", case=False, na=False)
+    for _, row in df_raw.iterrows():
+        row_values = [safe_str(value) for value in row.tolist() if safe_str(value)]
+        if not row_values:
+            continue
 
-    if not mask.any():
-        return ""
+        joined = " ".join(row_values)
+        normalized_joined = normalize_text_loose(joined)
+        if "klijent" not in normalized_joined:
+            continue
 
-    raw = df_raw.loc[mask].iloc[0, 0]
-    text = safe_str(raw)
+        match = re.search(r"klijent\s*:\s*(.+)", joined, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
 
-    if "Klijent:" in text:
-        return text.split("Klijent:", 1)[-1].strip()
-    return text.strip()
+        for idx, value in enumerate(row_values):
+            normalized_value = normalize_header_name(value)
+            if normalized_value == "klijent":
+                if idx + 1 < len(row_values):
+                    return row_values[idx + 1]
+                return ""
+
+            if normalize_text_loose(value).startswith("klijent"):
+                return re.sub(r"(?i)^klijent\s*:?\s*", "", value).strip()
+
+        return joined.strip()
+
+    return ""
+
+
+def prepare_portfelj_dataframe(df_raw: pd.DataFrame):
+    return build_named_table_from_raw(
+        df_raw,
+        alias_map=PORTFELJ_COLUMN_ALIASES,
+        required_fields=[
+            "position_type",
+            "currency",
+            "position_name",
+            "isin",
+            "instrument_type",
+            "quantity",
+            "price",
+            "fx_rate",
+            "accrued_interest",
+            "amount_base",
+        ],
+        context="PORTFELJ XML",
+        min_matches=6,
+    )
 
 
 def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
-    """
-    Column mapping:
-    A = 0
-    B = 1
-    C = 2
-    D = 3
-    E = 4
-    I = 8
-    K = 10
-    N = 13
-    O = 14
-    Q = 16
-    R = 17
-    """
     fund_name = extract_fund_name_from_portfelj(df_raw)
+    portfelj_df, portfelj_columns = prepare_portfelj_dataframe(df_raw)
 
     asset_class_df = additional_data["ASSET_CLASS"]
+    asset_class_columns = additional_data["ASSET_CLASS_COLUMNS"]
     actual_cash_df = additional_data["ACTUAL_CASH"]
+    actual_cash_columns = additional_data["ACTUAL_CASH_COLUMNS"]
 
     asset_class_map = {}
     for _, row in asset_class_df.iterrows():
-        cro = safe_str(row.iloc[0])
-        eng = safe_str(row.iloc[1]) if len(row) > 1 else ""
+        cro = safe_str(get_row_value(row, asset_class_columns, "croatian"))
+        eng = safe_str(get_row_value(row, asset_class_columns, "english"))
         if cro:
             asset_class_map[normalize_text(cro)] = eng
 
@@ -282,40 +518,40 @@ def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
     actual_cash_keys_loose = set()
 
     for _, row in actual_cash_df.iterrows():
-        key = safe_str(row.iloc[0])
+        key = safe_str(get_row_value(row, actual_cash_columns, "cash_item"))
         if key:
             actual_cash_keys_strict.add(normalize_text(key))
             actual_cash_keys_loose.add(normalize_text_loose(key))
 
     holdings = []
 
-    for _, row in df_raw.iterrows():
-        col_a = safe_str(row.iloc[0]) if len(row) > 0 else ""
-        col_b = safe_str(row.iloc[1]) if len(row) > 1 else ""
-        col_c = safe_str(row.iloc[2]) if len(row) > 2 else ""
-        col_d = safe_str(row.iloc[3]) if len(row) > 3 else ""
-        col_e = safe_str(row.iloc[4]) if len(row) > 4 else ""
-        col_i = row.iloc[8] if len(row) > 8 else None
-        col_k = row.iloc[10] if len(row) > 10 else None
-        col_n = row.iloc[13] if len(row) > 13 else None
-        col_o = row.iloc[14] if len(row) > 14 else None
+    for _, row in portfelj_df.iterrows():
+        position_type = safe_str(get_row_value(row, portfelj_columns, "position_type"))
+        currency = safe_str(get_row_value(row, portfelj_columns, "currency"))
+        position_name = safe_str(get_row_value(row, portfelj_columns, "position_name"))
+        isin = safe_str(get_row_value(row, portfelj_columns, "isin"))
+        instrument_type = safe_str(get_row_value(row, portfelj_columns, "instrument_type"))
+        quantity = get_row_value(row, portfelj_columns, "quantity")
+        price = get_row_value(row, portfelj_columns, "price")
+        fx_source = get_row_value(row, portfelj_columns, "fx_rate")
+        accrued_interest = get_row_value(row, portfelj_columns, "accrued_interest")
 
-        if col_e == "RDG" and col_d != "":
-            fx_raw = safe_float(col_n, default=0.0)
+        if normalize_text(instrument_type) == "rdg" and isin != "":
+            fx_raw = safe_float(fx_source, default=0.0)
             if fx_raw == 0:
                 fx = 1.0
             else:
                 fx = round(1.0 / fx_raw, 4)
 
-            holding_class = asset_class_map.get(normalize_text(col_a), "")
+            holding_class = asset_class_map.get(normalize_text(position_type), "")
 
             holdings.append({
-                "[HOLDING_ISIN]": col_d,
-                "[HOLDING_NAME]": col_c,
-                "[HOLDING_QUANTITY]": safe_float(col_i, 0.0),
-                "[HOLDING_CURRENCY]": col_b,
-                "[HOLDING_PRICE]": safe_float(col_k, 0.0),
-                "[HOLDING_ACC_INTEREST]": safe_float(col_o, 0.0),
+                "[HOLDING_ISIN]": isin,
+                "[HOLDING_NAME]": position_name,
+                "[HOLDING_QUANTITY]": safe_float(quantity, 0.0),
+                "[HOLDING_CURRENCY]": currency,
+                "[HOLDING_PRICE]": safe_float(price, 0.0),
+                "[HOLDING_ACC_INTEREST]": safe_float(accrued_interest, 0.0),
                 "[HOLDING_FX]": fx,
                 "[HOLDING_CLASS]": holding_class
             })
@@ -324,18 +560,18 @@ def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
     projected_cash = 0.0
     total_nav = 0.0
 
-    for _, row in df_raw.iterrows():
-        col_a = safe_str(row.iloc[0]) if len(row) > 0 else ""
-        col_c = safe_str(row.iloc[2]) if len(row) > 2 else ""
-        col_e = safe_str(row.iloc[4]) if len(row) > 4 else ""
-        col_r = row.iloc[17] if len(row) > 17 else None
-        r_val = safe_float(col_r, 0.0)
+    for _, row in portfelj_df.iterrows():
+        position_type = safe_str(get_row_value(row, portfelj_columns, "position_type"))
+        position_name = safe_str(get_row_value(row, portfelj_columns, "position_name"))
+        instrument_type = safe_str(get_row_value(row, portfelj_columns, "instrument_type"))
+        amount_base = get_row_value(row, portfelj_columns, "amount_base")
+        amount_value = safe_float(amount_base, 0.0)
 
-        if col_c != "":
-            total_nav += r_val
+        if position_name != "":
+            total_nav += amount_value
 
-        a_norm = normalize_text(col_a)
-        a_loose = normalize_text_loose(col_a)
+        a_norm = normalize_text(position_type)
+        a_loose = normalize_text_loose(position_type)
 
         is_actual_cash = (
             a_norm in actual_cash_keys_strict
@@ -343,10 +579,10 @@ def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
         )
 
         if is_actual_cash:
-            actual_cash += r_val
+            actual_cash += amount_value
 
-        if col_c != "" and col_e == "" and not is_actual_cash:
-            projected_cash += r_val
+        if position_name != "" and instrument_type == "" and not is_actual_cash:
+            projected_cash += amount_value
 
     return {
         "fund_name": fund_name,
@@ -361,30 +597,67 @@ def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
 # PRINOS PROCESSING
 # =========================================================
 
-def prepare_prinos_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
-    return df_raw.copy()
+def prepare_prinos_dataframe(df_raw: pd.DataFrame):
+    try:
+        prinos_df, prinos_columns = build_named_table_from_raw(
+            df_raw,
+            alias_map=PRINOS_COLUMN_ALIASES,
+            required_fields=[
+                "date",
+                "fund_name",
+                "fund_currency",
+                "number_of_units",
+                "nav_per_share",
+            ],
+            context="PRINOS XML",
+            min_matches=3,
+        )
+        return {
+            "data": prinos_df,
+            "columns": prinos_columns,
+        }
+    except ValueError:
+        prinos_df = df_raw.copy().reset_index(drop=True)
+        prinos_df.columns = [f"Column_{idx}" for idx in range(len(prinos_df.columns))]
+        prinos_columns = resolve_dataframe_columns(
+            prinos_df,
+            alias_map={},
+            required_fields=[
+                "date",
+                "fund_name",
+                "fund_currency",
+                "number_of_units",
+                "nav_per_share",
+            ],
+            context="PRINOS XML (legacy positional fallback)",
+            fallback_indices={
+                "date": 0,
+                "fund_name": 1,
+                "fund_currency": 4,
+                "number_of_units": 24,
+                "nav_per_share": 28,
+            },
+        )
+        return {
+            "data": prinos_df,
+            "columns": prinos_columns,
+        }
 
 
-def find_prinos_data(prinos_df: pd.DataFrame, fund_name: str, portfolio_date: date):
-    """
-    Corrected mapping:
-    A = date
-    B = fund name
-    E = FUND_CURRENCY  -> index 4
-    Y = NUMBER_OF_UNITS -> index 24
-    AC = NAV_PER_SHARE  -> index 28
-    """
+def find_prinos_data(prinos_data, fund_name: str, portfolio_date: date):
+    prinos_df = prinos_data["data"]
+    prinos_columns = prinos_data["columns"]
     target_date = portfolio_date.strftime("%d.%m.%Y")
     target_fund = normalize_text(fund_name)
 
     for _, row in prinos_df.iterrows():
-        col_a = safe_str(row.iloc[0]) if len(row) > 0 else ""
-        col_b = safe_str(row.iloc[1]) if len(row) > 1 else ""
+        row_date = safe_str(get_row_value(row, prinos_columns, "date"))
+        row_fund_name = safe_str(get_row_value(row, prinos_columns, "fund_name"))
 
-        if col_a == target_date and normalize_text(col_b) == target_fund:
-            fund_currency = safe_str(row.iloc[4]) if len(row) > 4 else ""
-            number_of_units = safe_float(row.iloc[24], 0.0) if len(row) > 24 else 0.0
-            nav_per_share = safe_float(row.iloc[28], 0.0) if len(row) > 28 else 0.0
+        if row_date == target_date and normalize_text(row_fund_name) == target_fund:
+            fund_currency = safe_str(get_row_value(row, prinos_columns, "fund_currency"))
+            number_of_units = safe_float(get_row_value(row, prinos_columns, "number_of_units"), 0.0)
+            nav_per_share = safe_float(get_row_value(row, prinos_columns, "nav_per_share"), 0.0)
 
             return {
                 "[FUND_CURRENCY]": fund_currency,
@@ -401,12 +674,56 @@ def find_prinos_data(prinos_df: pd.DataFrame, fund_name: str, portfolio_date: da
 
 def get_general_matches(additional_data: dict, fund_name: str) -> pd.DataFrame:
     general = additional_data["GENERAL"].copy()
+    general_columns = additional_data["GENERAL_COLUMNS"]
+    fund_name_column = general_columns["fund_name"]
 
     matches = general[
-        general.iloc[:, 1].astype(str).str.strip().str.casefold() == fund_name.strip().casefold()
+        general[fund_name_column].astype(str).str.strip().str.casefold() == fund_name.strip().casefold()
     ].copy()
 
     return matches
+
+
+def get_expected_output_entries(
+    additional_data: dict,
+    portfolio_date: date,
+    fund_names: set[str] | None = None,
+) -> list[dict]:
+    general = additional_data["GENERAL"]
+    general_columns = additional_data["GENERAL_COLUMNS"]
+    portfolio_date_str = portfolio_date.strftime("%Y%m%d")
+
+    normalized_fund_names = None
+    if fund_names is not None:
+        normalized_fund_names = {
+            normalize_text(fund_name)
+            for fund_name in fund_names
+            if safe_str(fund_name)
+        }
+
+    expected_entries = []
+
+    for _, row in general.iterrows():
+        fund_name = safe_str(get_row_value(row, general_columns, "fund_name"))
+        fund_isin = safe_str(get_row_value(row, general_columns, "fund_isin"))
+        fund_ticker = safe_str(get_row_value(row, general_columns, "fund_ticker"))
+        output_name = safe_str(get_row_value(row, general_columns, "output_name"))
+
+        if not fund_name or not fund_isin or not output_name:
+            continue
+
+        if normalized_fund_names is not None and normalize_text(fund_name) not in normalized_fund_names:
+            continue
+
+        expected_entries.append({
+            "fund_name": fund_name,
+            "fund_isin": fund_isin,
+            "fund_ticker": fund_ticker,
+            "output_name": output_name,
+            "filename": f"{sanitize_filename(output_name)}_{portfolio_date_str}.csv",
+        })
+
+    return expected_entries
 
 
 # =========================================================
@@ -502,19 +819,21 @@ def generate_outputs(
     prinos_source,
     portfelj_files,
     portfolio_date: date,
-    trade_date: date
+    trade_date: date | None = None
 ):
     template_raw, _ = load_template_workbook(template_source)
     additional_data = load_additional_data(additional_source)
+    trade_date = derive_trade_date(portfolio_date)
 
     if hasattr(prinos_source, "seek"):
         prinos_source.seek(0)
 
     prinos_df_raw = parse_excel_2003_xml(prinos_source)
-    prinos_df = prepare_prinos_dataframe(prinos_df_raw)
+    prinos_data = prepare_prinos_dataframe(prinos_df_raw)
 
     output_files = {}
     log_rows = []
+    processed_fund_names = set()
 
     portfolio_date_str = portfolio_date.strftime("%Y%m%d")
 
@@ -535,7 +854,9 @@ def generate_outputs(
             })
             continue
 
-        prinos_info = find_prinos_data(prinos_df, fund_name, portfolio_date)
+        processed_fund_names.add(fund_name)
+
+        prinos_info = find_prinos_data(prinos_data, fund_name, portfolio_date)
         if prinos_info is None:
             log_rows.append({
                 "PORTFELJ_FILE": pf.name,
@@ -555,11 +876,12 @@ def generate_outputs(
             })
             continue
 
+        general_columns = additional_data["GENERAL_COLUMNS"]
         for _, g_row in general_matches.iterrows():
-            fund_isin = safe_str(g_row.iloc[0]) if len(g_row) > 0 else ""
-            fund_name_general = safe_str(g_row.iloc[1]) if len(g_row) > 1 else fund_name
-            fund_ticker = safe_str(g_row.iloc[3]) if len(g_row) > 3 else ""
-            output_name = safe_str(g_row.iloc[4]) if len(g_row) > 4 else ""
+            fund_isin = safe_str(get_row_value(g_row, general_columns, "fund_isin"))
+            fund_name_general = safe_str(get_row_value(g_row, general_columns, "fund_name")) or fund_name
+            fund_ticker = safe_str(get_row_value(g_row, general_columns, "fund_ticker"))
+            output_name = safe_str(get_row_value(g_row, general_columns, "output_name"))
 
             if fund_isin == "":
                 log_rows.append({
@@ -575,7 +897,7 @@ def generate_outputs(
                     "PORTFELJ_FILE": pf.name,
                     "FUND_NAME": fund_name,
                     "STATUS": "Skipped",
-                    "MESSAGE": "Matching GENERAL row exists, but GENERAL column E (output filename) is empty."
+                    "MESSAGE": "Matching GENERAL row exists, but the output filename is empty."
                 })
                 continue
 
@@ -607,8 +929,38 @@ def generate_outputs(
                 "MESSAGE": f"Created {filename}"
             })
 
+    expected_entries = get_expected_output_entries(
+        additional_data=additional_data,
+        portfolio_date=portfolio_date,
+        fund_names=processed_fund_names,
+    )
+    created_filenames = set(output_files.keys())
+    missing_entries = [
+        entry for entry in expected_entries
+        if entry["filename"] not in created_filenames
+    ]
+
+    for entry in missing_entries:
+        missing_parts = [entry["fund_isin"]]
+        if entry["fund_ticker"]:
+            missing_parts.append(entry["fund_ticker"])
+        identifier = " / ".join(missing_parts)
+
+        log_rows.append({
+            "PORTFELJ_FILE": "",
+            "FUND_NAME": entry["fund_name"],
+            "STATUS": "Missing",
+            "MESSAGE": f"Expected share-class PCF not created: {identifier}"
+        })
+
     log_df = pd.DataFrame(log_rows)
-    return output_files, log_df
+    summary = {
+        "trade_date": trade_date,
+        "expected_output_count": len(expected_entries),
+        "created_output_count": len(output_files),
+        "missing_entries": missing_entries,
+    }
+    return output_files, log_df, summary
 
 
 # =========================================================
@@ -635,8 +987,8 @@ with col1:
     portfolio_date = st.date_input("Portfolio date", value=date.today())
 
 with col2:
-    default_trade_date = next_weekday(portfolio_date)
-    trade_date = st.date_input("Trade date", value=default_trade_date)
+    trade_date = derive_trade_date(portfolio_date)
+    st.text_input("Trade date", value=trade_date.strftime("%d.%m.%Y"), disabled=True)
 
 st.divider()
 
@@ -693,13 +1045,12 @@ if st.button("Generate CSV files", type="primary"):
             additional_source = DEFAULT_ADDITIONAL_DATA_PATH
 
         with st.spinner("Generating CSV files..."):
-            outputs, log_df = generate_outputs(
+            outputs, log_df, summary = generate_outputs(
                 template_source=template_source,
                 additional_source=additional_source,
                 prinos_source=uploaded_prinos,
                 portfelj_files=uploaded_portfelj,
-                portfolio_date=portfolio_date,
-                trade_date=trade_date
+                portfolio_date=portfolio_date
             )
 
         st.subheader("Processing log")
@@ -708,8 +1059,19 @@ if st.button("Generate CSV files", type="primary"):
         else:
             st.info("No log entries were produced.")
 
+        st.caption(
+            f"Trade date used for all generated PCFs: {summary['trade_date'].strftime('%d.%m.%Y')}"
+        )
+
         if outputs:
-            st.success(f"Created {len(outputs)} CSV file(s).")
+            if summary["missing_entries"]:
+                st.warning(
+                    "Created "
+                    f"{summary['created_output_count']} of {summary['expected_output_count']} "
+                    "expected share-class PCF(s) for the uploaded funds."
+                )
+            else:
+                st.success(f"Created {len(outputs)} CSV file(s).")
 
             zip_bytes = build_zip(outputs)
             st.download_button(
