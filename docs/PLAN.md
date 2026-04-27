@@ -4,9 +4,9 @@ Updated: 2026-04-27
 
 ## Current Turn
 
-1. Confirm whether the current requested work is complete.
-2. Distinguish between the finished output fix and optional future hardening work.
-3. Record that status clearly.
+1. Commit, push, and open an upstream PR for the completed PRINOS/local-runner fixes.
+2. Implement the `PORTFELJ` header-based, section-aware parser on a separate follow-up branch.
+3. Verify that the refactor reproduces the `output_rerun_20260427_091433` baseline CSV outputs.
 
 ## Status
 
@@ -46,6 +46,11 @@ Updated: 2026-04-27
 - Completed: Confirmed those `PORTFELJ` headers repeat by section in every sampled file, so the right refactor is header-based plus section-aware, not a naive single-header-table assumption.
 - Completed: Recorded `output_rerun_20260427_091433` as the baseline output set to match during future testing and refactors, unless the user changes the inputs or expected logic.
 - Completed: Confirmed the current requested output fix and rerun are done; any additional `PORTFELJ` header-based refactor is optional future hardening work, not required for the current result set.
+- Completed: Created branch `codex/prinos-class-fixes`, committed the current PRINOS/local-runner work, pushed it, and opened upstream PR `https://github.com/novicegitgud/tradeweb/pull/2`.
+- Completed: Created follow-up branch `codex/portfelj-header-parser` for the `PORTFELJ` parser refactor.
+- Completed: Replaced the positional `PORTFELJ` parser with a header-based, section-aware record extractor that reuses repeated header rows within each file.
+- Completed: Reran the generator into `output_portfelj_headers_20260427_092300`.
+- Completed: Verified that every generated CSV in `output_portfelj_headers_20260427_092300` matches the baseline folder `output_rerun_20260427_091433` exactly; only ZIP artifacts may differ as archives.
 
 ## Next Step
 
@@ -55,5 +60,7 @@ Updated: 2026-04-27
 - The newest rerun ZIP archive is `output_rerun_20260427_091433\tradeweb_csvs_20260427.zip`.
 - The verified reference rerun remains `output_rerun_20260427_091500\`.
 - The earlier rerun folder `output_rerun_20260427_090136\` contains the pre-fix output and should not be used as the final verified result.
-- The strongest next hardening step is to refactor `PORTFELJ` parsing to use those headers instead of fixed indexes, while preserving repeated-section scanning and current `Klijent:` extraction.
+- The current upstream PR for the PRINOS/local-runner fixes is `https://github.com/novicegitgud/tradeweb/pull/2`.
+- The current follow-up refactor output is in `output_portfelj_headers_20260427_092300\`.
+- The next hardening step after this would be to remove the remaining class-assignment-by-order assumption and map `GENERAL` rows to `PRINOS` classes explicitly.
 - For future testing, treat `output_rerun_20260427_091433\` as the expected comparison baseline.

@@ -90,6 +90,13 @@ def get_value_by_column_or_index(row, fallback_index: int, *aliases):
     return None
 
 
+def get_mapping_value(mapping: dict, *aliases):
+    label = find_column_label(mapping.keys(), *aliases)
+    if label is not None:
+        return mapping.get(label)
+    return None
+
+
 def build_duplicate_headers(raw_headers):
     counts = {}
     result = []
@@ -294,22 +301,46 @@ def extract_fund_name_from_portfelj(df_raw: pd.DataFrame) -> str:
     return text.strip()
 
 
+def is_portfelj_header_row(row_values: list[str]) -> bool:
+    normalized = [normalize_text_loose(value) for value in row_values]
+    expected_prefix = [
+        "vrsta pozicije",
+        "valuta",
+        "pozicija",
+        "isin",
+        "tip",
+    ]
+    return normalized[: len(expected_prefix)] == expected_prefix
+
+
+def extract_portfelj_records(df_raw: pd.DataFrame) -> list[dict]:
+    records = []
+    current_headers = None
+
+    for _, row in df_raw.iterrows():
+        row_values = [safe_str(value) for value in row.tolist()]
+
+        if is_portfelj_header_row(row_values):
+            current_headers = build_duplicate_headers(row_values)
+            continue
+
+        if current_headers is None:
+            continue
+
+        if not any(row_values):
+            continue
+
+        records.append({
+            header: row_values[idx] if idx < len(row_values) else ""
+            for idx, header in enumerate(current_headers)
+        })
+
+    return records
+
+
 def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
-    """
-    Column mapping:
-    A = 0
-    B = 1
-    C = 2
-    D = 3
-    E = 4
-    I = 8
-    K = 10
-    N = 13
-    O = 14
-    Q = 16
-    R = 17
-    """
     fund_name = extract_fund_name_from_portfelj(df_raw)
+    portfelj_records = extract_portfelj_records(df_raw)
 
     asset_class_df = additional_data["ASSET_CLASS"]
     actual_cash_df = additional_data["ACTUAL_CASH"]
@@ -332,16 +363,16 @@ def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
 
     holdings = []
 
-    for _, row in df_raw.iterrows():
-        col_a = safe_str(row.iloc[0]) if len(row) > 0 else ""
-        col_b = safe_str(row.iloc[1]) if len(row) > 1 else ""
-        col_c = safe_str(row.iloc[2]) if len(row) > 2 else ""
-        col_d = safe_str(row.iloc[3]) if len(row) > 3 else ""
-        col_e = safe_str(row.iloc[4]) if len(row) > 4 else ""
-        col_i = row.iloc[8] if len(row) > 8 else None
-        col_k = row.iloc[10] if len(row) > 10 else None
-        col_n = row.iloc[13] if len(row) > 13 else None
-        col_o = row.iloc[14] if len(row) > 14 else None
+    for record in portfelj_records:
+        col_a = safe_str(get_mapping_value(record, "Vrsta pozicije"))
+        col_b = safe_str(get_mapping_value(record, "Valuta"))
+        col_c = safe_str(get_mapping_value(record, "Pozicija"))
+        col_d = safe_str(get_mapping_value(record, "ISIN"))
+        col_e = safe_str(get_mapping_value(record, "Tip"))
+        col_i = get_mapping_value(record, "Količina")
+        col_k = get_mapping_value(record, "Cijena")
+        col_n = get_mapping_value(record, "Tečaj DV")
+        col_o = get_mapping_value(record, "Kamata")
 
         if col_e == "RDG" and col_d != "":
             fx_raw = safe_float(col_n, default=0.0)
@@ -367,11 +398,11 @@ def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
     projected_cash = 0.0
     total_nav = 0.0
 
-    for _, row in df_raw.iterrows():
-        col_a = safe_str(row.iloc[0]) if len(row) > 0 else ""
-        col_c = safe_str(row.iloc[2]) if len(row) > 2 else ""
-        col_e = safe_str(row.iloc[4]) if len(row) > 4 else ""
-        col_r = row.iloc[17] if len(row) > 17 else None
+    for record in portfelj_records:
+        col_a = safe_str(get_mapping_value(record, "Vrsta pozicije"))
+        col_c = safe_str(get_mapping_value(record, "Pozicija"))
+        col_e = safe_str(get_mapping_value(record, "Tip"))
+        col_r = get_mapping_value(record, "Iznos DV")
         r_val = safe_float(col_r, 0.0)
 
         if col_c != "":
