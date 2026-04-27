@@ -1,4 +1,3 @@
-import streamlit as st
 import pandas as pd
 from datetime import date, timedelta
 from pathlib import Path
@@ -6,12 +5,6 @@ from io import BytesIO
 import zipfile
 import re
 import unicodedata
-
-# =========================================================
-# CONFIG
-# =========================================================
-
-st.set_page_config(page_title="Tradeweb CSV Generator", layout="wide")
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = BASE_DIR / "template.xlsx"
@@ -76,6 +69,34 @@ def normalize_text_loose(s):
     return s
 
 
+def find_column_label(columns, *aliases):
+    normalized = {
+        normalize_text_loose(col): col
+        for col in columns
+    }
+    for alias in aliases:
+        match = normalized.get(normalize_text_loose(alias))
+        if match is not None:
+            return match
+    return None
+
+
+def get_value_by_column_or_index(row, fallback_index: int, *aliases):
+    label = find_column_label(row.index, *aliases)
+    if label is not None:
+        return row[label]
+    if 0 <= fallback_index < len(row):
+        return row.iloc[fallback_index]
+    return None
+
+
+def get_mapping_value(mapping: dict, *aliases):
+    label = find_column_label(mapping.keys(), *aliases)
+    if label is not None:
+        return mapping.get(label)
+    return None
+
+
 def build_duplicate_headers(raw_headers):
     counts = {}
     result = []
@@ -106,7 +127,7 @@ def sanitize_filename(name: str) -> str:
 # ROBUST XML PARSER FOR EXCEL 2003 XML
 # =========================================================
 
-def parse_excel_2003_xml(file_obj) -> pd.DataFrame:
+def load_excel_2003_xml_root(file_obj):
     """
     Parse Excel 2003 XML / SpreadsheetML while tolerating:
     - broken encoding declarations
@@ -162,12 +183,10 @@ def parse_excel_2003_xml(file_obj) -> pd.DataFrame:
     parser = etree.XMLParser(recover=True, huge_tree=True)
     root = etree.fromstring(text.encode("utf-8"), parser=parser)
 
-    ns = {"ss": "urn:schemas-microsoft-com:office:spreadsheet"}
-    table = root.find(".//ss:Worksheet/ss:Table", namespaces=ns)
+    return root
 
-    if table is None:
-        raise ValueError("Could not find Worksheet/Table in XML file.")
 
+def worksheet_table_to_dataframe(table, ns) -> pd.DataFrame:
     rows = []
     max_cols = 0
 
@@ -193,6 +212,37 @@ def parse_excel_2003_xml(file_obj) -> pd.DataFrame:
 
     padded_rows = [r + [None] * (max_cols - len(r)) for r in rows]
     return pd.DataFrame(padded_rows)
+
+
+def parse_excel_2003_xml_workbook(file_obj) -> dict[str, pd.DataFrame]:
+    root = load_excel_2003_xml_root(file_obj)
+
+    ns = {"ss": "urn:schemas-microsoft-com:office:spreadsheet"}
+    worksheets = root.findall(".//ss:Worksheet", namespaces=ns)
+
+    if not worksheets:
+        raise ValueError("Could not find any worksheets in XML file.")
+
+    workbook = {}
+    for idx, worksheet in enumerate(worksheets, start=1):
+        sheet_name = worksheet.get("{urn:schemas-microsoft-com:office:spreadsheet}Name") or f"Sheet{idx}"
+        table = worksheet.find("ss:Table", namespaces=ns)
+        if table is None:
+            workbook[sheet_name] = pd.DataFrame()
+            continue
+        workbook[sheet_name] = worksheet_table_to_dataframe(table, ns)
+
+    return workbook
+
+
+def parse_excel_2003_xml(file_obj) -> pd.DataFrame:
+    workbook = parse_excel_2003_xml_workbook(file_obj)
+    first_sheet = next(iter(workbook.values()), None)
+
+    if first_sheet is None:
+        raise ValueError("Could not find Worksheet/Table in XML file.")
+
+    return first_sheet
 
 
 # =========================================================
@@ -251,22 +301,46 @@ def extract_fund_name_from_portfelj(df_raw: pd.DataFrame) -> str:
     return text.strip()
 
 
+def is_portfelj_header_row(row_values: list[str]) -> bool:
+    normalized = [normalize_text_loose(value) for value in row_values]
+    expected_prefix = [
+        "vrsta pozicije",
+        "valuta",
+        "pozicija",
+        "isin",
+        "tip",
+    ]
+    return normalized[: len(expected_prefix)] == expected_prefix
+
+
+def extract_portfelj_records(df_raw: pd.DataFrame) -> list[dict]:
+    records = []
+    current_headers = None
+
+    for _, row in df_raw.iterrows():
+        row_values = [safe_str(value) for value in row.tolist()]
+
+        if is_portfelj_header_row(row_values):
+            current_headers = build_duplicate_headers(row_values)
+            continue
+
+        if current_headers is None:
+            continue
+
+        if not any(row_values):
+            continue
+
+        records.append({
+            header: row_values[idx] if idx < len(row_values) else ""
+            for idx, header in enumerate(current_headers)
+        })
+
+    return records
+
+
 def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
-    """
-    Column mapping:
-    A = 0
-    B = 1
-    C = 2
-    D = 3
-    E = 4
-    I = 8
-    K = 10
-    N = 13
-    O = 14
-    Q = 16
-    R = 17
-    """
     fund_name = extract_fund_name_from_portfelj(df_raw)
+    portfelj_records = extract_portfelj_records(df_raw)
 
     asset_class_df = additional_data["ASSET_CLASS"]
     actual_cash_df = additional_data["ACTUAL_CASH"]
@@ -289,16 +363,16 @@ def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
 
     holdings = []
 
-    for _, row in df_raw.iterrows():
-        col_a = safe_str(row.iloc[0]) if len(row) > 0 else ""
-        col_b = safe_str(row.iloc[1]) if len(row) > 1 else ""
-        col_c = safe_str(row.iloc[2]) if len(row) > 2 else ""
-        col_d = safe_str(row.iloc[3]) if len(row) > 3 else ""
-        col_e = safe_str(row.iloc[4]) if len(row) > 4 else ""
-        col_i = row.iloc[8] if len(row) > 8 else None
-        col_k = row.iloc[10] if len(row) > 10 else None
-        col_n = row.iloc[13] if len(row) > 13 else None
-        col_o = row.iloc[14] if len(row) > 14 else None
+    for record in portfelj_records:
+        col_a = safe_str(get_mapping_value(record, "Vrsta pozicije"))
+        col_b = safe_str(get_mapping_value(record, "Valuta"))
+        col_c = safe_str(get_mapping_value(record, "Pozicija"))
+        col_d = safe_str(get_mapping_value(record, "ISIN"))
+        col_e = safe_str(get_mapping_value(record, "Tip"))
+        col_i = get_mapping_value(record, "Količina")
+        col_k = get_mapping_value(record, "Cijena")
+        col_n = get_mapping_value(record, "Tečaj DV")
+        col_o = get_mapping_value(record, "Kamata")
 
         if col_e == "RDG" and col_d != "":
             fx_raw = safe_float(col_n, default=0.0)
@@ -324,11 +398,11 @@ def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
     projected_cash = 0.0
     total_nav = 0.0
 
-    for _, row in df_raw.iterrows():
-        col_a = safe_str(row.iloc[0]) if len(row) > 0 else ""
-        col_c = safe_str(row.iloc[2]) if len(row) > 2 else ""
-        col_e = safe_str(row.iloc[4]) if len(row) > 4 else ""
-        col_r = row.iloc[17] if len(row) > 17 else None
+    for record in portfelj_records:
+        col_a = safe_str(get_mapping_value(record, "Vrsta pozicije"))
+        col_c = safe_str(get_mapping_value(record, "Pozicija"))
+        col_e = safe_str(get_mapping_value(record, "Tip"))
+        col_r = get_mapping_value(record, "Iznos DV")
         r_val = safe_float(col_r, 0.0)
 
         if col_c != "":
@@ -365,26 +439,101 @@ def prepare_prinos_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     return df_raw.copy()
 
 
+def build_table_from_header_row(df_raw: pd.DataFrame, header_row_index: int = 1) -> pd.DataFrame:
+    if df_raw.shape[0] <= header_row_index:
+        return pd.DataFrame()
+
+    headers = build_duplicate_headers(df_raw.iloc[header_row_index].tolist())
+    data = df_raw.iloc[header_row_index + 1:].copy().reset_index(drop=True)
+    data.columns = headers
+    return data
+
+
+def class_label_sort_key(label: str):
+    match = re.match(r"([A-Za-z]+)(\d+)", safe_str(label))
+    if match:
+        return match.group(1).upper(), int(match.group(2))
+    return safe_str(label).upper(), 0
+
+
+def extract_prinos_class_data(prinos_workbook: dict[str, pd.DataFrame], portfolio_date: date) -> dict[str, list[dict]]:
+    target_date = portfolio_date.strftime("%d.%m.%Y")
+    class_data_by_fund = {}
+
+    for sheet_name, sheet_df in list(prinos_workbook.items())[1:]:
+        if sheet_df.empty:
+            continue
+
+        header_text = safe_str(sheet_df.iloc[0, 0]) if sheet_df.shape[0] > 0 and sheet_df.shape[1] > 0 else ""
+        header_match = re.search(r"Fond:\s*(.*?)\s+Klasa udjela:\s*([A-Za-z]+\d+)", header_text)
+        if not header_match:
+            continue
+
+        fund_name = header_match.group(1).strip()
+        class_label = header_match.group(2).strip()
+
+        table_df = build_table_from_header_row(sheet_df, header_row_index=1)
+        if table_df.empty:
+            continue
+
+        date_column = find_column_label(table_df.columns, "Datum")
+        units_column = find_column_label(table_df.columns, "Broj udjela")
+        price_column = find_column_label(table_df.columns, "Cijena udjela")
+        price_dv_column = find_column_label(table_df.columns, "Cijena udjela dv")
+
+        if date_column is None or units_column is None:
+            continue
+
+        matching_rows = table_df[table_df[date_column].astype(str).str.strip() == target_date]
+        if matching_rows.empty:
+            continue
+
+        row = matching_rows.iloc[0]
+        class_data_by_fund.setdefault(fund_name, []).append({
+            "sheet_name": sheet_name,
+            "class_label": class_label,
+            "[NUMBER_OF_UNITS]": safe_float(row[units_column], 0.0),
+            "[NAV_PER_SHARE]": safe_float(
+                row[price_column] if price_column is not None else row[price_dv_column] if price_dv_column is not None else None,
+                0.0
+            ),
+        })
+
+    for fund_name, entries in class_data_by_fund.items():
+        entries.sort(key=lambda item: class_label_sort_key(item["class_label"]))
+
+    return class_data_by_fund
+
+
 def find_prinos_data(prinos_df: pd.DataFrame, fund_name: str, portfolio_date: date):
-    """
-    Corrected mapping:
-    A = date
-    B = fund name
-    E = FUND_CURRENCY  -> index 4
-    Y = NUMBER_OF_UNITS -> index 24
-    AC = NAV_PER_SHARE  -> index 28
-    """
     target_date = portfolio_date.strftime("%d.%m.%Y")
     target_fund = normalize_text(fund_name)
+    table_df = build_table_from_header_row(prinos_df, header_row_index=1)
 
-    for _, row in prinos_df.iterrows():
-        col_a = safe_str(row.iloc[0]) if len(row) > 0 else ""
-        col_b = safe_str(row.iloc[1]) if len(row) > 1 else ""
+    if table_df.empty:
+        return None
+
+    date_column = find_column_label(table_df.columns, "Datum")
+    fund_column = find_column_label(table_df.columns, "Klijent")
+    currency_column = find_column_label(table_df.columns, "Valuta")
+    units_column = find_column_label(table_df.columns, "Broj udjela")
+    price_column = find_column_label(table_df.columns, "Cijena udjela")
+    price_dv_column = find_column_label(table_df.columns, "Cijena udjela dv")
+
+    if date_column is None or fund_column is None:
+        return None
+
+    for _, row in table_df.iterrows():
+        col_a = safe_str(row[date_column])
+        col_b = safe_str(row[fund_column])
 
         if col_a == target_date and normalize_text(col_b) == target_fund:
-            fund_currency = safe_str(row.iloc[4]) if len(row) > 4 else ""
-            number_of_units = safe_float(row.iloc[24], 0.0) if len(row) > 24 else 0.0
-            nav_per_share = safe_float(row.iloc[28], 0.0) if len(row) > 28 else 0.0
+            fund_currency = safe_str(row[currency_column]) if currency_column is not None else ""
+            number_of_units = safe_float(row[units_column], 0.0) if units_column is not None else 0.0
+            nav_per_share = safe_float(
+                row[price_column] if price_column is not None else row[price_dv_column] if price_dv_column is not None else None,
+                0.0
+            )
 
             return {
                 "[FUND_CURRENCY]": fund_currency,
@@ -401,9 +550,19 @@ def find_prinos_data(prinos_df: pd.DataFrame, fund_name: str, portfolio_date: da
 
 def get_general_matches(additional_data: dict, fund_name: str) -> pd.DataFrame:
     general = additional_data["GENERAL"].copy()
+    fund_name_column = find_column_label(general.columns, "FUND NAME")
+
+    if fund_name_column is not None:
+        fund_name_values = general[fund_name_column]
+    elif general.shape[1] > 1:
+        fund_name_values = general.iloc[:, 1]
+    elif general.shape[1] > 0:
+        fund_name_values = general.iloc[:, 0]
+    else:
+        return general.iloc[0:0].copy()
 
     matches = general[
-        general.iloc[:, 1].astype(str).str.strip().str.casefold() == fund_name.strip().casefold()
+        fund_name_values.astype(str).str.strip().str.casefold() == fund_name.strip().casefold()
     ].copy()
 
     return matches
@@ -510,8 +669,10 @@ def generate_outputs(
     if hasattr(prinos_source, "seek"):
         prinos_source.seek(0)
 
-    prinos_df_raw = parse_excel_2003_xml(prinos_source)
+    prinos_workbook = parse_excel_2003_xml_workbook(prinos_source)
+    prinos_df_raw = next(iter(prinos_workbook.values()))
     prinos_df = prepare_prinos_dataframe(prinos_df_raw)
+    prinos_class_data = extract_prinos_class_data(prinos_workbook, portfolio_date)
 
     output_files = {}
     log_rows = []
@@ -555,11 +716,13 @@ def generate_outputs(
             })
             continue
 
-        for _, g_row in general_matches.iterrows():
-            fund_isin = safe_str(g_row.iloc[0]) if len(g_row) > 0 else ""
-            fund_name_general = safe_str(g_row.iloc[1]) if len(g_row) > 1 else fund_name
-            fund_ticker = safe_str(g_row.iloc[3]) if len(g_row) > 3 else ""
-            output_name = safe_str(g_row.iloc[4]) if len(g_row) > 4 else ""
+        class_entries = prinos_class_data.get(fund_name, [])
+
+        for class_index, (_, g_row) in enumerate(general_matches.iterrows()):
+            fund_isin = safe_str(get_value_by_column_or_index(g_row, 0, "FUND ISIN"))
+            fund_name_general = safe_str(get_value_by_column_or_index(g_row, 1, "FUND NAME")) or fund_name
+            fund_ticker = safe_str(get_value_by_column_or_index(g_row, 3, "BLOOMBERG TICKER"))
+            output_name = safe_str(get_value_by_column_or_index(g_row, 4, "OUTPUT FILE NAME"))
 
             if fund_isin == "":
                 log_rows.append({
@@ -591,6 +754,12 @@ def generate_outputs(
             }
             fund_level_values.update(prinos_info)
 
+            if class_index < len(class_entries):
+                fund_level_values.update({
+                    "[NUMBER_OF_UNITS]": class_entries[class_index]["[NUMBER_OF_UNITS]"],
+                    "[NAV_PER_SHARE]": class_entries[class_index]["[NAV_PER_SHARE]"],
+                })
+
             output_df = build_output_from_template(
                 template_raw=template_raw,
                 fund_level_values=fund_level_values,
@@ -611,14 +780,15 @@ def generate_outputs(
     return output_files, log_df
 
 
-# =========================================================
-# UI
-# =========================================================
+def run_streamlit_app():
+    import streamlit as st
 
-st.title("Tradeweb CSV Generator")
+    st.set_page_config(page_title="Tradeweb CSV Generator", layout="wide")
 
-st.markdown(
-    """
+    st.title("Tradeweb CSV Generator")
+
+    st.markdown(
+        """
 Upload:
 - **1 PRINOS XML**
 - **1 or more PORTFELJ XML files**
@@ -627,109 +797,113 @@ Upload:
 
 If ADDITIONAL_DATA or template are not uploaded, the app will use files from the same folder as `Tradeweb.py`.
 """
-)
+    )
 
-col1, col2 = st.columns(2)
+    col1, col2 = st.columns(2)
 
-with col1:
-    portfolio_date = st.date_input("Portfolio date", value=date.today())
+    with col1:
+        portfolio_date = st.date_input("Portfolio date", value=date.today())
 
-with col2:
-    default_trade_date = next_weekday(portfolio_date)
-    trade_date = st.date_input("Trade date", value=default_trade_date)
+    with col2:
+        default_trade_date = next_weekday(portfolio_date)
+        trade_date = st.date_input("Trade date", value=default_trade_date)
 
-st.divider()
+    st.divider()
 
-uploaded_prinos = st.file_uploader(
-    "Upload PRINOS XML",
-    type=["xml"],
-    accept_multiple_files=False
-)
+    uploaded_prinos = st.file_uploader(
+        "Upload PRINOS XML",
+        type=["xml"],
+        accept_multiple_files=False
+    )
 
-uploaded_portfelj = st.file_uploader(
-    "Upload PORTFELJ XML files",
-    type=["xml"],
-    accept_multiple_files=True
-)
+    uploaded_portfelj = st.file_uploader(
+        "Upload PORTFELJ XML files",
+        type=["xml"],
+        accept_multiple_files=True
+    )
 
-uploaded_additional = st.file_uploader(
-    "Upload ADDITIONAL_DATA.xlsx (optional)",
-    type=["xlsx"],
-    accept_multiple_files=False
-)
+    uploaded_additional = st.file_uploader(
+        "Upload ADDITIONAL_DATA.xlsx (optional)",
+        type=["xlsx"],
+        accept_multiple_files=False
+    )
 
-uploaded_template = st.file_uploader(
-    "Upload template.xlsx (optional)",
-    type=["xlsx"],
-    accept_multiple_files=False
-)
+    uploaded_template = st.file_uploader(
+        "Upload template.xlsx (optional)",
+        type=["xlsx"],
+        accept_multiple_files=False
+    )
 
-st.divider()
+    st.divider()
 
-if st.button("Generate CSV files", type="primary"):
-    try:
-        if uploaded_prinos is None:
-            st.error("Please upload the PRINOS XML file.")
-            st.stop()
-
-        if not uploaded_portfelj:
-            st.error("Please upload at least one PORTFELJ XML file.")
-            st.stop()
-
-        if uploaded_template is not None:
-            template_source = uploaded_template
-        else:
-            if not DEFAULT_TEMPLATE_PATH.exists():
-                st.error(f"Template file not found: {DEFAULT_TEMPLATE_PATH}")
+    if st.button("Generate CSV files", type="primary"):
+        try:
+            if uploaded_prinos is None:
+                st.error("Please upload the PRINOS XML file.")
                 st.stop()
-            template_source = DEFAULT_TEMPLATE_PATH
 
-        if uploaded_additional is not None:
-            additional_source = uploaded_additional
-        else:
-            if not DEFAULT_ADDITIONAL_DATA_PATH.exists():
-                st.error(f"Default ADDITIONAL_DATA file not found: {DEFAULT_ADDITIONAL_DATA_PATH}")
+            if not uploaded_portfelj:
+                st.error("Please upload at least one PORTFELJ XML file.")
                 st.stop()
-            additional_source = DEFAULT_ADDITIONAL_DATA_PATH
 
-        with st.spinner("Generating CSV files..."):
-            outputs, log_df = generate_outputs(
-                template_source=template_source,
-                additional_source=additional_source,
-                prinos_source=uploaded_prinos,
-                portfelj_files=uploaded_portfelj,
-                portfolio_date=portfolio_date,
-                trade_date=trade_date
-            )
+            if uploaded_template is not None:
+                template_source = uploaded_template
+            else:
+                if not DEFAULT_TEMPLATE_PATH.exists():
+                    st.error(f"Template file not found: {DEFAULT_TEMPLATE_PATH}")
+                    st.stop()
+                template_source = DEFAULT_TEMPLATE_PATH
 
-        st.subheader("Processing log")
-        if not log_df.empty:
-            st.dataframe(log_df, use_container_width=True)
-        else:
-            st.info("No log entries were produced.")
+            if uploaded_additional is not None:
+                additional_source = uploaded_additional
+            else:
+                if not DEFAULT_ADDITIONAL_DATA_PATH.exists():
+                    st.error(f"Default ADDITIONAL_DATA file not found: {DEFAULT_ADDITIONAL_DATA_PATH}")
+                    st.stop()
+                additional_source = DEFAULT_ADDITIONAL_DATA_PATH
 
-        if outputs:
-            st.success(f"Created {len(outputs)} CSV file(s).")
-
-            zip_bytes = build_zip(outputs)
-            st.download_button(
-                label="Download all CSV files as ZIP",
-                data=zip_bytes,
-                file_name=f"tradeweb_csvs_{trade_date.strftime('%Y%m%d')}.zip",
-                mime="application/zip"
-            )
-
-            st.subheader("Individual files")
-            for filename, content in outputs.items():
-                st.download_button(
-                    label=f"Download {filename}",
-                    data=content,
-                    file_name=filename,
-                    mime="text/csv",
-                    key=filename
+            with st.spinner("Generating CSV files..."):
+                outputs, log_df = generate_outputs(
+                    template_source=template_source,
+                    additional_source=additional_source,
+                    prinos_source=uploaded_prinos,
+                    portfelj_files=uploaded_portfelj,
+                    portfolio_date=portfolio_date,
+                    trade_date=trade_date
                 )
-        else:
-            st.warning("No CSV files were created. Check the processing log above.")
 
-    except Exception as e:
-        st.exception(e)
+            st.subheader("Processing log")
+            if not log_df.empty:
+                st.dataframe(log_df, use_container_width=True)
+            else:
+                st.info("No log entries were produced.")
+
+            if outputs:
+                st.success(f"Created {len(outputs)} CSV file(s).")
+
+                zip_bytes = build_zip(outputs)
+                st.download_button(
+                    label="Download all CSV files as ZIP",
+                    data=zip_bytes,
+                    file_name=f"tradeweb_csvs_{trade_date.strftime('%Y%m%d')}.zip",
+                    mime="application/zip"
+                )
+
+                st.subheader("Individual files")
+                for filename, content in outputs.items():
+                    st.download_button(
+                        label=f"Download {filename}",
+                        data=content,
+                        file_name=filename,
+                        mime="text/csv",
+                        key=filename
+                    )
+            else:
+                st.warning("No CSV files were created. Check the processing log above.")
+
+        except Exception as e:
+            st.exception(e)
+
+
+if __name__ == "__main__":
+    run_streamlit_app()
