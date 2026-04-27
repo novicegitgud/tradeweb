@@ -102,24 +102,42 @@ def sanitize_filename(name: str) -> str:
     return name
 
 
+def find_first_header_row(df_raw: pd.DataFrame, required_headers: list[str]) -> int:
+    required = {normalize_text(h) for h in required_headers}
+
+    for idx in range(len(df_raw)):
+        row_values = {
+            normalize_text(v)
+            for v in df_raw.iloc[idx].tolist()
+            if safe_str(v) != ""
+        }
+
+        if required.issubset(row_values):
+            return idx
+
+    raise ValueError(f"Could not find header row containing: {', '.join(required_headers)}")
+
+
+def make_named_dataframe_from_first_header(
+    df_raw: pd.DataFrame,
+    required_headers: list[str]
+) -> pd.DataFrame:
+    header_idx = find_first_header_row(df_raw, required_headers)
+
+    headers = [safe_str(v) for v in df_raw.iloc[header_idx].tolist()]
+    headers = build_duplicate_headers(headers)
+
+    df = df_raw.iloc[header_idx + 1:].copy().reset_index(drop=True)
+    df.columns = headers
+
+    return df
+
+
 # =========================================================
 # ROBUST XML PARSER FOR EXCEL 2003 XML
 # =========================================================
 
-def parse_excel_2003_xml(file_obj) -> pd.DataFrame:
-    """
-    Parse Excel 2003 XML / SpreadsheetML while tolerating:
-    - broken encoding declarations
-    - invalid control characters
-    - non-standard characters
-    - minor malformed XML
-
-    Important fix:
-    prefer UTF-8 with replacement before cp1250 fallback,
-    so valid Croatian letters do not become mojibake like RaÄŤun.
-    """
-    from lxml import etree
-
+def _decode_xml_bytes(file_obj) -> str:
     if hasattr(file_obj, "seek"):
         file_obj.seek(0)
 
@@ -130,43 +148,36 @@ def parse_excel_2003_xml(file_obj) -> pd.DataFrame:
 
     raw = raw.lstrip(b"\xef\xbb\xbf")
 
-    # 1) Try strict UTF-8 first
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        # 2) If that fails, still prefer UTF-8 but keep going through bad bytes
         text = raw.decode("utf-8", errors="replace")
 
-        # 3) Only if UTF-8 result looks very bad, fall back to cp1250
-        #    This avoids turning "Račun" into "RaÄŤun"
         suspicious = text.count("�")
         if suspicious > 20:
             try:
                 text_cp1250 = raw.decode("cp1250")
-                # keep cp1250 only if it clearly looks better
                 if text_cp1250.count("�") < suspicious:
                     text = text_cp1250
             except Exception:
                 pass
 
-    # Remove illegal XML 1.0 control characters
     text = re.sub(r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD]", "", text)
 
-    # Escape stray ampersands
     text = re.sub(
         r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9A-Fa-f]+;)",
         "&amp;",
         text
     )
 
-    parser = etree.XMLParser(recover=True, huge_tree=True)
-    root = etree.fromstring(text.encode("utf-8"), parser=parser)
+    return text
 
-    ns = {"ss": "urn:schemas-microsoft-com:office:spreadsheet"}
-    table = root.find(".//ss:Worksheet/ss:Table", namespaces=ns)
+
+def _worksheet_to_dataframe(worksheet, ns) -> pd.DataFrame:
+    table = worksheet.find("ss:Table", namespaces=ns)
 
     if table is None:
-        raise ValueError("Could not find Worksheet/Table in XML file.")
+        return pd.DataFrame()
 
     rows = []
     max_cols = 0
@@ -177,6 +188,7 @@ def parse_excel_2003_xml(file_obj) -> pd.DataFrame:
 
         for cell in row.findall("ss:Cell", namespaces=ns):
             index_attr = cell.get("{urn:schemas-microsoft-com:office:spreadsheet}Index")
+
             if index_attr:
                 target_col = int(index_attr)
                 while current_col < target_col:
@@ -195,6 +207,59 @@ def parse_excel_2003_xml(file_obj) -> pd.DataFrame:
     return pd.DataFrame(padded_rows)
 
 
+def parse_excel_2003_xml(file_obj) -> pd.DataFrame:
+    from lxml import etree
+
+    text = _decode_xml_bytes(file_obj)
+
+    parser = etree.XMLParser(recover=True, huge_tree=True)
+    root = etree.fromstring(text.encode("utf-8"), parser=parser)
+
+    ns = {"ss": "urn:schemas-microsoft-com:office:spreadsheet"}
+    worksheet = root.find(".//ss:Worksheet", namespaces=ns)
+
+    if worksheet is None:
+        raise ValueError("Could not find Worksheet in XML file.")
+
+    df = _worksheet_to_dataframe(worksheet, ns)
+
+    if df.empty:
+        raise ValueError("Could not find Worksheet/Table in XML file.")
+
+    return df
+
+
+def parse_excel_2003_xml_workbook(file_obj) -> dict[str, pd.DataFrame]:
+    """
+    Parse all worksheets from an Excel 2003 XML / SpreadsheetML file.
+    Used for PRINOS because NAV_PER_SHARE is now taken from class-specific sheets.
+    """
+    from lxml import etree
+
+    text = _decode_xml_bytes(file_obj)
+
+    parser = etree.XMLParser(recover=True, huge_tree=True)
+    root = etree.fromstring(text.encode("utf-8"), parser=parser)
+
+    ns = {"ss": "urn:schemas-microsoft-com:office:spreadsheet"}
+
+    workbook = {}
+
+    for worksheet in root.findall(".//ss:Worksheet", namespaces=ns):
+        sheet_name = worksheet.get("{urn:schemas-microsoft-com:office:spreadsheet}Name", "")
+        if not sheet_name:
+            sheet_name = f"Sheet{len(workbook) + 1}"
+
+        df = _worksheet_to_dataframe(worksheet, ns)
+        if not df.empty:
+            workbook[sheet_name] = df
+
+    if not workbook:
+        raise ValueError("Could not find any worksheets in XML file.")
+
+    return workbook
+
+
 # =========================================================
 # LOAD TEMPLATE / ADDITIONAL DATA
 # =========================================================
@@ -211,6 +276,7 @@ def load_additional_data(additional_source):
 
     required = ["GENERAL", "ASSET_CLASS", "ACTUAL_CASH"]
     missing = [s for s in required if s not in sheets]
+
     if missing:
         raise ValueError(f"Missing sheet(s) in ADDITIONAL_DATA.xlsx: {', '.join(missing)}")
 
@@ -237,8 +303,8 @@ def extract_fund_name_from_portfelj(df_raw: pd.DataFrame) -> str:
     if df_raw.empty:
         return ""
 
-    col_a = df_raw.iloc[:, 0].astype(str)
-    mask = col_a.str.contains("Klijent:", case=False, na=False)
+    first_col = df_raw.iloc[:, 0].astype(str)
+    mask = first_col.str.contains("Klijent:", case=False, na=False)
 
     if not mask.any():
         return ""
@@ -248,25 +314,26 @@ def extract_fund_name_from_portfelj(df_raw: pd.DataFrame) -> str:
 
     if "Klijent:" in text:
         return text.split("Klijent:", 1)[-1].strip()
+
     return text.strip()
 
 
 def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
-    """
-    Column mapping:
-    A = 0
-    B = 1
-    C = 2
-    D = 3
-    E = 4
-    I = 8
-    K = 10
-    N = 13
-    O = 14
-    Q = 16
-    R = 17
-    """
+    required_headers = [
+        "Vrsta pozicije",
+        "Valuta",
+        "Pozicija",
+        "ISIN",
+        "Tip",
+        "Količina",
+        "Cijena",
+        "Tečaj DV",
+        "Kamata",
+        "Iznos DV",
+    ]
+
     fund_name = extract_fund_name_from_portfelj(df_raw)
+    df = make_named_dataframe_from_first_header(df_raw, required_headers)
 
     asset_class_df = additional_data["ASSET_CLASS"]
     actual_cash_df = additional_data["ACTUAL_CASH"]
@@ -275,6 +342,7 @@ def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
     for _, row in asset_class_df.iterrows():
         cro = safe_str(row.iloc[0])
         eng = safe_str(row.iloc[1]) if len(row) > 1 else ""
+
         if cro:
             asset_class_map[normalize_text(cro)] = eng
 
@@ -283,77 +351,74 @@ def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
 
     for _, row in actual_cash_df.iterrows():
         key = safe_str(row.iloc[0])
+
         if key:
             actual_cash_keys_strict.add(normalize_text(key))
             actual_cash_keys_loose.add(normalize_text_loose(key))
 
     holdings = []
 
-    for _, row in df_raw.iterrows():
-        col_a = safe_str(row.iloc[0]) if len(row) > 0 else ""
-        col_b = safe_str(row.iloc[1]) if len(row) > 1 else ""
-        col_c = safe_str(row.iloc[2]) if len(row) > 2 else ""
-        col_d = safe_str(row.iloc[3]) if len(row) > 3 else ""
-        col_e = safe_str(row.iloc[4]) if len(row) > 4 else ""
-        col_i = row.iloc[8] if len(row) > 8 else None
-        col_k = row.iloc[10] if len(row) > 10 else None
-        col_n = row.iloc[13] if len(row) > 13 else None
-        col_o = row.iloc[14] if len(row) > 14 else None
+    for _, row in df.iterrows():
+        vrsta_pozicije = safe_str(row["Vrsta pozicije"])
+        valuta = safe_str(row["Valuta"])
+        pozicija = safe_str(row["Pozicija"])
+        isin = safe_str(row["ISIN"])
+        tip = safe_str(row["Tip"])
 
-        if col_e == "RDG" and col_d != "":
-            fx_raw = safe_float(col_n, default=0.0)
+        if tip == "RDG" and isin != "":
+            fx_raw = safe_float(row["Tečaj DV"], default=0.0)
+
             if fx_raw == 0:
                 fx = 1.0
             else:
                 fx = round(1.0 / fx_raw, 4)
 
-            holding_class = asset_class_map.get(normalize_text(col_a), "")
+            holding_class = asset_class_map.get(normalize_text(vrsta_pozicije), "")
 
             holdings.append({
-                "[HOLDING_ISIN]": col_d,
-                "[HOLDING_NAME]": col_c,
-                "[HOLDING_QUANTITY]": safe_float(col_i, 0.0),
-                "[HOLDING_CURRENCY]": col_b,
-                "[HOLDING_PRICE]": safe_float(col_k, 0.0),
-                "[HOLDING_ACC_INTEREST]": safe_float(col_o, 0.0),
+                "[HOLDING_ISIN]": isin,
+                "[HOLDING_NAME]": pozicija,
+                "[HOLDING_QUANTITY]": safe_float(row["Količina"], 0.0),
+                "[HOLDING_CURRENCY]": valuta,
+                "[HOLDING_PRICE]": safe_float(row["Cijena"], 0.0),
+                "[HOLDING_ACC_INTEREST]": safe_float(row["Kamata"], 0.0),
                 "[HOLDING_FX]": fx,
-                "[HOLDING_CLASS]": holding_class
+                "[HOLDING_CLASS]": holding_class,
             })
 
     actual_cash = 0.0
     projected_cash = 0.0
     total_nav = 0.0
 
-    for _, row in df_raw.iterrows():
-        col_a = safe_str(row.iloc[0]) if len(row) > 0 else ""
-        col_c = safe_str(row.iloc[2]) if len(row) > 2 else ""
-        col_e = safe_str(row.iloc[4]) if len(row) > 4 else ""
-        col_r = row.iloc[17] if len(row) > 17 else None
-        r_val = safe_float(col_r, 0.0)
+    for _, row in df.iterrows():
+        vrsta_pozicije = safe_str(row["Vrsta pozicije"])
+        pozicija = safe_str(row["Pozicija"])
+        tip = safe_str(row["Tip"])
+        iznos_dv = safe_float(row["Iznos DV"], 0.0)
 
-        if col_c != "":
-            total_nav += r_val
+        if pozicija != "":
+            total_nav += iznos_dv
 
-        a_norm = normalize_text(col_a)
-        a_loose = normalize_text_loose(col_a)
+        vrsta_norm = normalize_text(vrsta_pozicije)
+        vrsta_loose = normalize_text_loose(vrsta_pozicije)
 
         is_actual_cash = (
-            a_norm in actual_cash_keys_strict
-            or a_loose in actual_cash_keys_loose
+            vrsta_norm in actual_cash_keys_strict
+            or vrsta_loose in actual_cash_keys_loose
         )
 
         if is_actual_cash:
-            actual_cash += r_val
+            actual_cash += iznos_dv
 
-        if col_c != "" and col_e == "" and not is_actual_cash:
-            projected_cash += r_val
+        if pozicija != "" and tip == "" and not is_actual_cash:
+            projected_cash += iznos_dv
 
     return {
         "fund_name": fund_name,
         "holdings": holdings,
         "actual_cash": actual_cash,
         "projected_cash": projected_cash,
-        "total_nav": total_nav
+        "total_nav": total_nav,
     }
 
 
@@ -361,38 +426,79 @@ def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
 # PRINOS PROCESSING
 # =========================================================
 
-def prepare_prinos_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
-    return df_raw.copy()
-
-
-def find_prinos_data(prinos_df: pd.DataFrame, fund_name: str, portfolio_date: date):
+def find_prinos_data(prinos_df_raw: pd.DataFrame, fund_name: str, portfolio_date: date):
     """
-    Corrected mapping:
-    A = date
-    B = fund name
-    E = FUND_CURRENCY  -> index 4
-    Y = NUMBER_OF_UNITS -> index 24
-    AC = NAV_PER_SHARE  -> index 28
+    Main PRINOS table still used for:
+    - FUND_CURRENCY
+    - NUMBER_OF_UNITS
+
+    NAV_PER_SHARE is handled separately from class-specific sheets.
     """
+    required_headers = [
+        "Datum",
+        "Klijent",
+        "Valuta",
+        "Broj udjela",
+    ]
+
+    prinos_df = make_named_dataframe_from_first_header(prinos_df_raw, required_headers)
+
     target_date = portfolio_date.strftime("%d.%m.%Y")
     target_fund = normalize_text(fund_name)
 
     for _, row in prinos_df.iterrows():
-        col_a = safe_str(row.iloc[0]) if len(row) > 0 else ""
-        col_b = safe_str(row.iloc[1]) if len(row) > 1 else ""
+        datum = safe_str(row["Datum"])
+        klijent = safe_str(row["Klijent"])
 
-        if col_a == target_date and normalize_text(col_b) == target_fund:
-            fund_currency = safe_str(row.iloc[4]) if len(row) > 4 else ""
-            number_of_units = safe_float(row.iloc[24], 0.0) if len(row) > 24 else 0.0
-            nav_per_share = safe_float(row.iloc[28], 0.0) if len(row) > 28 else 0.0
-
+        if datum == target_date and normalize_text(klijent) == target_fund:
             return {
-                "[FUND_CURRENCY]": fund_currency,
-                "[NUMBER_OF_UNITS]": number_of_units,
-                "[NAV_PER_SHARE]": nav_per_share
+                "[FUND_CURRENCY]": safe_str(row["Valuta"]),
+                "[NUMBER_OF_UNITS]": safe_float(row["Broj udjela"], 0.0),
             }
 
     return None
+
+
+def find_class_nav_per_share(
+    prinos_sheets: dict[str, pd.DataFrame],
+    sheet_name: str,
+    portfolio_date: date
+):
+    """
+    NAV_PER_SHARE is taken from PRINOS class-specific sheet:
+    - sheet name from ADDITIONAL_DATA / GENERAL / column F
+    - row where Datum equals portfolio date
+    - column Cijena udjela
+    """
+    sheet_name = safe_str(sheet_name)
+
+    if sheet_name not in prinos_sheets:
+        available = ", ".join(prinos_sheets.keys())
+        raise ValueError(
+            f"PRINOS sheet '{sheet_name}' was not found. "
+            f"Available sheets: {available}"
+        )
+
+    df_raw = prinos_sheets[sheet_name]
+
+    required_headers = [
+        "Datum",
+        "Cijena udjela",
+    ]
+
+    df = make_named_dataframe_from_first_header(df_raw, required_headers)
+    target_date = portfolio_date.strftime("%d.%m.%Y")
+
+    for _, row in df.iterrows():
+        datum = safe_str(row["Datum"])
+
+        if datum == target_date:
+            return safe_float(row["Cijena udjela"], 0.0)
+
+    raise ValueError(
+        f"No NAV per share found in PRINOS sheet '{sheet_name}' "
+        f"for date {target_date}."
+    )
 
 
 # =========================================================
@@ -403,7 +509,8 @@ def get_general_matches(additional_data: dict, fund_name: str) -> pd.DataFrame:
     general = additional_data["GENERAL"].copy()
 
     matches = general[
-        general.iloc[:, 1].astype(str).str.strip().str.casefold() == fund_name.strip().casefold()
+        general.iloc[:, 1].astype(str).str.strip().str.casefold()
+        == fund_name.strip().casefold()
     ].copy()
 
     return matches
@@ -415,13 +522,19 @@ def get_general_matches(additional_data: dict, fund_name: str) -> pd.DataFrame:
 
 def replace_placeholders_in_row(row_values, replacements: dict):
     result = []
+
     for val in row_values:
         sval = safe_str(val)
         result.append(replacements.get(sval, val))
+
     return result
 
 
-def build_output_from_template(template_raw: pd.DataFrame, fund_level_values: dict, holdings: list[dict]) -> pd.DataFrame:
+def build_output_from_template(
+    template_raw: pd.DataFrame,
+    fund_level_values: dict,
+    holdings: list[dict]
+) -> pd.DataFrame:
     rows = template_raw.fillna("").values.tolist()
 
     holding_placeholder_names = {
@@ -436,8 +549,10 @@ def build_output_from_template(template_raw: pd.DataFrame, fund_level_values: di
     }
 
     holding_row_idx = None
+
     for i, row in enumerate(rows):
         row_set = set(safe_str(v) for v in row)
+
         if row_set & holding_placeholder_names:
             holding_row_idx = i
             break
@@ -485,9 +600,11 @@ def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 def build_zip(file_map: dict[str, bytes]) -> bytes:
     mem = BytesIO()
+
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         for filename, content in file_map.items():
             zf.writestr(filename, content)
+
     mem.seek(0)
     return mem.getvalue()
 
@@ -510,8 +627,10 @@ def generate_outputs(
     if hasattr(prinos_source, "seek"):
         prinos_source.seek(0)
 
-    prinos_df_raw = parse_excel_2003_xml(prinos_source)
-    prinos_df = prepare_prinos_dataframe(prinos_df_raw)
+    prinos_sheets = parse_excel_2003_xml_workbook(prinos_source)
+
+    first_prinos_sheet_name = list(prinos_sheets.keys())[0]
+    prinos_df_raw = prinos_sheets[first_prinos_sheet_name]
 
     output_files = {}
     log_rows = []
@@ -526,6 +645,7 @@ def generate_outputs(
         portfelj_info = process_portfelj(portfelj_df_raw, additional_data)
 
         fund_name = portfelj_info["fund_name"]
+
         if not fund_name:
             log_rows.append({
                 "PORTFELJ_FILE": pf.name,
@@ -535,7 +655,8 @@ def generate_outputs(
             })
             continue
 
-        prinos_info = find_prinos_data(prinos_df, fund_name, portfolio_date)
+        prinos_info = find_prinos_data(prinos_df_raw, fund_name, portfolio_date)
+
         if prinos_info is None:
             log_rows.append({
                 "PORTFELJ_FILE": pf.name,
@@ -546,6 +667,7 @@ def generate_outputs(
             continue
 
         general_matches = get_general_matches(additional_data, fund_name)
+
         if general_matches.empty:
             log_rows.append({
                 "PORTFELJ_FILE": pf.name,
@@ -558,8 +680,10 @@ def generate_outputs(
         for _, g_row in general_matches.iterrows():
             fund_isin = safe_str(g_row.iloc[0]) if len(g_row) > 0 else ""
             fund_name_general = safe_str(g_row.iloc[1]) if len(g_row) > 1 else fund_name
+            class_currency = safe_str(g_row.iloc[2]) if len(g_row) > 2 else ""
             fund_ticker = safe_str(g_row.iloc[3]) if len(g_row) > 3 else ""
             output_name = safe_str(g_row.iloc[4]) if len(g_row) > 4 else ""
+            prinos_class_sheet = safe_str(g_row.iloc[5]) if len(g_row) > 5 else ""
 
             if fund_isin == "":
                 log_rows.append({
@@ -567,6 +691,15 @@ def generate_outputs(
                     "FUND_NAME": fund_name,
                     "STATUS": "Skipped",
                     "MESSAGE": "Matching GENERAL row exists, but FUND ISIN is empty."
+                })
+                continue
+
+            if class_currency == "":
+                log_rows.append({
+                    "PORTFELJ_FILE": pf.name,
+                    "FUND_NAME": fund_name,
+                    "STATUS": "Skipped",
+                    "MESSAGE": f"GENERAL column C / CLASS_CURRENCY is empty for ISIN {fund_isin}."
                 })
                 continue
 
@@ -579,17 +712,35 @@ def generate_outputs(
                 })
                 continue
 
+            if prinos_class_sheet == "":
+                log_rows.append({
+                    "PORTFELJ_FILE": pf.name,
+                    "FUND_NAME": fund_name,
+                    "STATUS": "Skipped",
+                    "MESSAGE": f"GENERAL column F / PRINOS sheet name is empty for ISIN {fund_isin}."
+                })
+                continue
+
+            nav_per_share = find_class_nav_per_share(
+                prinos_sheets=prinos_sheets,
+                sheet_name=prinos_class_sheet,
+                portfolio_date=portfolio_date
+            )
+
             fund_level_values = {
                 "[FUND_NAME]": fund_name_general,
                 "[PORTFOLIO_DATE]": portfolio_date_str,
                 "[TRADE_DATE]": trade_date.strftime("%Y%m%d"),
                 "[FUND_ISIN]": fund_isin,
                 "[FUND_TICKER]": fund_ticker,
+                "[FUND_CURRENCY]": prinos_info["[FUND_CURRENCY]"],
+                "[CLASS_CURRENCY]": class_currency,
+                "[NUMBER_OF_UNITS]": prinos_info["[NUMBER_OF_UNITS]"],
+                "[NAV_PER_SHARE]": nav_per_share,
                 "[ACTUAL_CASH]": portfelj_info["actual_cash"],
                 "[PROJECTED_CASH]": portfelj_info["projected_cash"],
                 "[TOTAL_NAV]": portfelj_info["total_nav"],
             }
-            fund_level_values.update(prinos_info)
 
             output_df = build_output_from_template(
                 template_raw=template_raw,
@@ -604,7 +755,12 @@ def generate_outputs(
                 "PORTFELJ_FILE": pf.name,
                 "FUND_NAME": fund_name,
                 "STATUS": "Created",
-                "MESSAGE": f"Created {filename}"
+                "MESSAGE": (
+                    f"Created {filename}. "
+                    f"CLASS_CURRENCY={class_currency}, "
+                    f"PRINOS sheet={prinos_class_sheet}, "
+                    f"NAV_PER_SHARE={nav_per_share}"
+                )
             })
 
     log_df = pd.DataFrame(log_rows)
@@ -703,6 +859,7 @@ if st.button("Generate CSV files", type="primary"):
             )
 
         st.subheader("Processing log")
+
         if not log_df.empty:
             st.dataframe(log_df, use_container_width=True)
         else:
@@ -712,6 +869,7 @@ if st.button("Generate CSV files", type="primary"):
             st.success(f"Created {len(outputs)} CSV file(s).")
 
             zip_bytes = build_zip(outputs)
+
             st.download_button(
                 label="Download all CSV files as ZIP",
                 data=zip_bytes,
@@ -720,6 +878,7 @@ if st.button("Generate CSV files", type="primary"):
             )
 
             st.subheader("Individual files")
+
             for filename, content in outputs.items():
                 st.download_button(
                     label=f"Download {filename}",
