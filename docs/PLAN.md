@@ -4,9 +4,9 @@ Updated: 2026-04-27
 
 ## Current Turn
 
-1. Rerun the generator again after the corrected `ADDITIONAL_DATA.xlsx` replacement.
-2. Validate the processing log and the generated class-level PRINOS fields for the new run.
-3. Record the newest output location and validation outcome.
+1. Fix the NAV-per-share source for cross listings in the current PRINOS/class-sheet logic.
+2. Rerun the current input set and validate the corrected cross-listing outputs.
+3. Record the new output location and validation outcome.
 
 ## Status
 
@@ -58,6 +58,12 @@ Updated: 2026-04-27
 - Completed: Reran the generator again after the corrected additional-data replacement into `output_rerun_20260427_163835`.
 - Completed: Confirmed the newest processing log contains 11 `Created` entries and no skipped files.
 - Completed: Validated the generated `NAV_PER_SHARE` and `SHARES_OUTSTANDING` values against the current PRINOS class sheets for all 11 generated CSV files; no mismatches were found.
+- Completed: Verified that the pushed commits are on remote branches `codex/prinos-class-fixes` and `codex/portfelj-header-parser`, while `main` on the fork remains unchanged.
+- Completed: Changed the PRINOS NAV-per-share source to prefer `Cijena udjela dv` instead of `Cijena udjela`, while still taking `Broj udjela` from the respective class sheet.
+- Completed: Reran the generator into `output_rerun_20260427_205742`.
+- Completed: Confirmed the processing log contains 11 `Created` entries and no skipped files.
+- Completed: Validated the generated `NAV_PER_SHARE` and `SHARES_OUTSTANDING` values against the current PRINOS class sheets for all 11 generated CSV files; no mismatches were found after the NAV-source change.
+- Completed: Spot-checked the reported cross-listing cases and confirmed the outputs now use the depositary-value NAVs (for example `7SLO` / `ICSLOETF` and `7BET` / `ICBETNET` are now aligned on `FUND_BASE=EUR` and near-equal `NAV_PER_SHARE` values, while retaining class-specific shares outstanding).
 
 ## Next Step
 
@@ -73,3 +79,5 @@ Updated: 2026-04-27
 - For future testing, treat `output_rerun_20260427_091433\` as the expected comparison baseline.
 - The latest user-input rerun output is in `output_rerun_20260427_163556\`.
 - The newest corrected-additional-data rerun output is in `output_rerun_20260427_163835\`.
+- The fork `main` branch still points to `68d5d29`; pushed work currently lives on feature branches until merged.
+- The latest NAV-source-corrected rerun output is in `output_rerun_20260427_205742\`.

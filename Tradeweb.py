@@ -456,6 +456,15 @@ def class_label_sort_key(label: str):
     return safe_str(label).upper(), 0
 
 
+def get_nav_per_share_value(row, price_dv_column, price_column):
+    # Prefer the depositary-value share price so cross listings align with the base share-class currency.
+    if price_dv_column is not None:
+        return safe_float(row[price_dv_column], 0.0)
+    if price_column is not None:
+        return safe_float(row[price_column], 0.0)
+    return 0.0
+
+
 def extract_prinos_class_data(prinos_workbook: dict[str, pd.DataFrame], portfolio_date: date) -> dict[str, list[dict]]:
     target_date = portfolio_date.strftime("%d.%m.%Y")
     class_data_by_fund = {}
@@ -493,10 +502,7 @@ def extract_prinos_class_data(prinos_workbook: dict[str, pd.DataFrame], portfoli
             "sheet_name": sheet_name,
             "class_label": class_label,
             "[NUMBER_OF_UNITS]": safe_float(row[units_column], 0.0),
-            "[NAV_PER_SHARE]": safe_float(
-                row[price_column] if price_column is not None else row[price_dv_column] if price_dv_column is not None else None,
-                0.0
-            ),
+            "[NAV_PER_SHARE]": get_nav_per_share_value(row, price_dv_column, price_column),
         })
 
     for fund_name, entries in class_data_by_fund.items():
@@ -530,10 +536,7 @@ def find_prinos_data(prinos_df: pd.DataFrame, fund_name: str, portfolio_date: da
         if col_a == target_date and normalize_text(col_b) == target_fund:
             fund_currency = safe_str(row[currency_column]) if currency_column is not None else ""
             number_of_units = safe_float(row[units_column], 0.0) if units_column is not None else 0.0
-            nav_per_share = safe_float(
-                row[price_column] if price_column is not None else row[price_dv_column] if price_dv_column is not None else None,
-                0.0
-            )
+            nav_per_share = get_nav_per_share_value(row, price_dv_column, price_column)
 
             return {
                 "[FUND_CURRENCY]": fund_currency,
