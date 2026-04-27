@@ -4,9 +4,9 @@ Updated: 2026-04-27
 
 ## Current Turn
 
-1. Commit, push, and open an upstream PR for the completed PRINOS/local-runner fixes.
-2. Implement the `PORTFELJ` header-based, section-aware parser on a separate follow-up branch.
-3. Verify that the refactor reproduces the `output_rerun_20260427_091433` baseline CSV outputs.
+1. Rerun the generator again after the corrected `ADDITIONAL_DATA.xlsx` replacement.
+2. Validate the processing log and the generated class-level PRINOS fields for the new run.
+3. Record the newest output location and validation outcome.
 
 ## Status
 
@@ -51,6 +51,13 @@ Updated: 2026-04-27
 - Completed: Replaced the positional `PORTFELJ` parser with a header-based, section-aware record extractor that reuses repeated header rows within each file.
 - Completed: Reran the generator into `output_portfelj_headers_20260427_092300`.
 - Completed: Verified that every generated CSV in `output_portfelj_headers_20260427_092300` matches the baseline folder `output_rerun_20260427_091433` exactly; only ZIP artifacts may differ as archives.
+- Completed: Detected that the new `PRINOS` file is for portfolio date `27.04.2026`.
+- Completed: Reran the generator against the updated `input` folder into `output_rerun_20260427_163556`.
+- Completed: Confirmed the processing log contains 5 `Created` entries and no skipped files.
+- Completed: Validated the generated `NAV_PER_SHARE` and `SHARES_OUTSTANDING` values against the current PRINOS class sheets for all 5 generated CSV files; no mismatches were found.
+- Completed: Reran the generator again after the corrected additional-data replacement into `output_rerun_20260427_163835`.
+- Completed: Confirmed the newest processing log contains 11 `Created` entries and no skipped files.
+- Completed: Validated the generated `NAV_PER_SHARE` and `SHARES_OUTSTANDING` values against the current PRINOS class sheets for all 11 generated CSV files; no mismatches were found.
 
 ## Next Step
 
@@ -64,3 +71,5 @@ Updated: 2026-04-27
 - The current follow-up refactor output is in `output_portfelj_headers_20260427_092300\`.
 - The next hardening step after this would be to remove the remaining class-assignment-by-order assumption and map `GENERAL` rows to `PRINOS` classes explicitly.
 - For future testing, treat `output_rerun_20260427_091433\` as the expected comparison baseline.
+- The latest user-input rerun output is in `output_rerun_20260427_163556\`.
+- The newest corrected-additional-data rerun output is in `output_rerun_20260427_163835\`.
