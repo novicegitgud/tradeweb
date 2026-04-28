@@ -137,7 +137,9 @@ def make_named_dataframe_from_first_header(
 # ROBUST XML PARSER FOR EXCEL 2003 XML
 # =========================================================
 
-def _decode_xml_bytes(file_obj) -> str:
+def parse_excel_2003_xml(file_obj) -> pd.DataFrame:
+    from lxml import etree
+
     if hasattr(file_obj, "seek"):
         file_obj.seek(0)
 
@@ -170,14 +172,14 @@ def _decode_xml_bytes(file_obj) -> str:
         text
     )
 
-    return text
+    parser = etree.XMLParser(recover=True, huge_tree=True)
+    root = etree.fromstring(text.encode("utf-8"), parser=parser)
 
-
-def _worksheet_to_dataframe(worksheet, ns) -> pd.DataFrame:
-    table = worksheet.find("ss:Table", namespaces=ns)
+    ns = {"ss": "urn:schemas-microsoft-com:office:spreadsheet"}
+    table = root.find(".//ss:Worksheet/ss:Table", namespaces=ns)
 
     if table is None:
-        return pd.DataFrame()
+        raise ValueError("Could not find Worksheet/Table in XML file.")
 
     rows = []
     max_cols = 0
@@ -205,59 +207,6 @@ def _worksheet_to_dataframe(worksheet, ns) -> pd.DataFrame:
 
     padded_rows = [r + [None] * (max_cols - len(r)) for r in rows]
     return pd.DataFrame(padded_rows)
-
-
-def parse_excel_2003_xml(file_obj) -> pd.DataFrame:
-    from lxml import etree
-
-    text = _decode_xml_bytes(file_obj)
-
-    parser = etree.XMLParser(recover=True, huge_tree=True)
-    root = etree.fromstring(text.encode("utf-8"), parser=parser)
-
-    ns = {"ss": "urn:schemas-microsoft-com:office:spreadsheet"}
-    worksheet = root.find(".//ss:Worksheet", namespaces=ns)
-
-    if worksheet is None:
-        raise ValueError("Could not find Worksheet in XML file.")
-
-    df = _worksheet_to_dataframe(worksheet, ns)
-
-    if df.empty:
-        raise ValueError("Could not find Worksheet/Table in XML file.")
-
-    return df
-
-
-def parse_excel_2003_xml_workbook(file_obj) -> dict[str, pd.DataFrame]:
-    """
-    Parse all worksheets from an Excel 2003 XML / SpreadsheetML file.
-    Used for PRINOS because NAV_PER_SHARE is now taken from class-specific sheets.
-    """
-    from lxml import etree
-
-    text = _decode_xml_bytes(file_obj)
-
-    parser = etree.XMLParser(recover=True, huge_tree=True)
-    root = etree.fromstring(text.encode("utf-8"), parser=parser)
-
-    ns = {"ss": "urn:schemas-microsoft-com:office:spreadsheet"}
-
-    workbook = {}
-
-    for worksheet in root.findall(".//ss:Worksheet", namespaces=ns):
-        sheet_name = worksheet.get("{urn:schemas-microsoft-com:office:spreadsheet}Name", "")
-        if not sheet_name:
-            sheet_name = f"Sheet{len(workbook) + 1}"
-
-        df = _worksheet_to_dataframe(worksheet, ns)
-        if not df.empty:
-            workbook[sheet_name] = df
-
-    if not workbook:
-        raise ValueError("Could not find any worksheets in XML file.")
-
-    return workbook
 
 
 # =========================================================
@@ -427,18 +376,12 @@ def process_portfelj(df_raw: pd.DataFrame, additional_data: dict):
 # =========================================================
 
 def find_prinos_data(prinos_df_raw: pd.DataFrame, fund_name: str, portfolio_date: date):
-    """
-    Main PRINOS table still used for:
-    - FUND_CURRENCY
-    - NUMBER_OF_UNITS
-
-    NAV_PER_SHARE is handled separately from class-specific sheets.
-    """
     required_headers = [
         "Datum",
         "Klijent",
         "Valuta",
         "Broj udjela",
+        "Cijena udjela dv",
     ]
 
     prinos_df = make_named_dataframe_from_first_header(prinos_df_raw, required_headers)
@@ -454,51 +397,10 @@ def find_prinos_data(prinos_df_raw: pd.DataFrame, fund_name: str, portfolio_date
             return {
                 "[FUND_CURRENCY]": safe_str(row["Valuta"]),
                 "[NUMBER_OF_UNITS]": safe_float(row["Broj udjela"], 0.0),
+                "[NAV_PER_SHARE]": safe_float(row["Cijena udjela dv"], 0.0),
             }
 
     return None
-
-
-def find_class_nav_per_share(
-    prinos_sheets: dict[str, pd.DataFrame],
-    sheet_name: str,
-    portfolio_date: date
-):
-    """
-    NAV_PER_SHARE is taken from PRINOS class-specific sheet:
-    - sheet name from ADDITIONAL_DATA / GENERAL / column F
-    - row where Datum equals portfolio date
-    - column Cijena udjela
-    """
-    sheet_name = safe_str(sheet_name)
-
-    if sheet_name not in prinos_sheets:
-        available = ", ".join(prinos_sheets.keys())
-        raise ValueError(
-            f"PRINOS sheet '{sheet_name}' was not found. "
-            f"Available sheets: {available}"
-        )
-
-    df_raw = prinos_sheets[sheet_name]
-
-    required_headers = [
-        "Datum",
-        "Cijena udjela",
-    ]
-
-    df = make_named_dataframe_from_first_header(df_raw, required_headers)
-    target_date = portfolio_date.strftime("%d.%m.%Y")
-
-    for _, row in df.iterrows():
-        datum = safe_str(row["Datum"])
-
-        if datum == target_date:
-            return safe_float(row["Cijena udjela"], 0.0)
-
-    raise ValueError(
-        f"No NAV per share found in PRINOS sheet '{sheet_name}' "
-        f"for date {target_date}."
-    )
 
 
 # =========================================================
@@ -627,10 +529,7 @@ def generate_outputs(
     if hasattr(prinos_source, "seek"):
         prinos_source.seek(0)
 
-    prinos_sheets = parse_excel_2003_xml_workbook(prinos_source)
-
-    first_prinos_sheet_name = list(prinos_sheets.keys())[0]
-    prinos_df_raw = prinos_sheets[first_prinos_sheet_name]
+    prinos_df_raw = parse_excel_2003_xml(prinos_source)
 
     output_files = {}
     log_rows = []
@@ -680,10 +579,8 @@ def generate_outputs(
         for _, g_row in general_matches.iterrows():
             fund_isin = safe_str(g_row.iloc[0]) if len(g_row) > 0 else ""
             fund_name_general = safe_str(g_row.iloc[1]) if len(g_row) > 1 else fund_name
-            class_currency = safe_str(g_row.iloc[2]) if len(g_row) > 2 else ""
             fund_ticker = safe_str(g_row.iloc[3]) if len(g_row) > 3 else ""
             output_name = safe_str(g_row.iloc[4]) if len(g_row) > 4 else ""
-            prinos_class_sheet = safe_str(g_row.iloc[5]) if len(g_row) > 5 else ""
 
             if fund_isin == "":
                 log_rows.append({
@@ -691,15 +588,6 @@ def generate_outputs(
                     "FUND_NAME": fund_name,
                     "STATUS": "Skipped",
                     "MESSAGE": "Matching GENERAL row exists, but FUND ISIN is empty."
-                })
-                continue
-
-            if class_currency == "":
-                log_rows.append({
-                    "PORTFELJ_FILE": pf.name,
-                    "FUND_NAME": fund_name,
-                    "STATUS": "Skipped",
-                    "MESSAGE": f"GENERAL column C / CLASS_CURRENCY is empty for ISIN {fund_isin}."
                 })
                 continue
 
@@ -712,35 +600,18 @@ def generate_outputs(
                 })
                 continue
 
-            if prinos_class_sheet == "":
-                log_rows.append({
-                    "PORTFELJ_FILE": pf.name,
-                    "FUND_NAME": fund_name,
-                    "STATUS": "Skipped",
-                    "MESSAGE": f"GENERAL column F / PRINOS sheet name is empty for ISIN {fund_isin}."
-                })
-                continue
-
-            nav_per_share = find_class_nav_per_share(
-                prinos_sheets=prinos_sheets,
-                sheet_name=prinos_class_sheet,
-                portfolio_date=portfolio_date
-            )
-
             fund_level_values = {
                 "[FUND_NAME]": fund_name_general,
                 "[PORTFOLIO_DATE]": portfolio_date_str,
                 "[TRADE_DATE]": trade_date.strftime("%Y%m%d"),
                 "[FUND_ISIN]": fund_isin,
                 "[FUND_TICKER]": fund_ticker,
-                "[FUND_CURRENCY]": prinos_info["[FUND_CURRENCY]"],
-                "[CLASS_CURRENCY]": class_currency,
-                "[NUMBER_OF_UNITS]": prinos_info["[NUMBER_OF_UNITS]"],
-                "[NAV_PER_SHARE]": nav_per_share,
                 "[ACTUAL_CASH]": portfelj_info["actual_cash"],
                 "[PROJECTED_CASH]": portfelj_info["projected_cash"],
                 "[TOTAL_NAV]": portfelj_info["total_nav"],
             }
+
+            fund_level_values.update(prinos_info)
 
             output_df = build_output_from_template(
                 template_raw=template_raw,
@@ -755,12 +626,7 @@ def generate_outputs(
                 "PORTFELJ_FILE": pf.name,
                 "FUND_NAME": fund_name,
                 "STATUS": "Created",
-                "MESSAGE": (
-                    f"Created {filename}. "
-                    f"CLASS_CURRENCY={class_currency}, "
-                    f"PRINOS sheet={prinos_class_sheet}, "
-                    f"NAV_PER_SHARE={nav_per_share}"
-                )
+                "MESSAGE": f"Created {filename}"
             })
 
     log_df = pd.DataFrame(log_rows)
